@@ -85,7 +85,7 @@ jobs:
           dispatched = set()
           for c in comments:
             body = c.get("body") or ""
-            for mm in re.finditer(r"TCM-DISPATCHED:\\s*([A-Za-z0-9._:-]+)", body):
+            for mm in re.finditer(r"TCM-DISPATCHED:\s*([A-Za-z0-9._:-]+)", body):
               dispatched.add(mm.group(1))
 
           # 3) Dispatch bootstrap-pr.yml for tasks with no depends_on and not already dispatched
@@ -103,6 +103,8 @@ jobs:
             base_branch = str(t.get("base_branch") or "main").strip()
             claude_mode = str(((t.get("claude") or {}).get("mode")) or "manual").strip()
 
+            claude_comment = f"@claude Task {task_id}: {title}\n\nRef: {orch_repo}#{orch_issue_number}"
+
             depends_on = t.get("depends_on") or []
             if depends_on and len(depends_on) > 0:
               # Phase 1: skip dependent tasks
@@ -118,8 +120,6 @@ jobs:
             # Determine target repo default branch (so we can dispatch against it reliably)
             repo_info = sh(["gh", "api", f"/repos/{repo}"])
             default_branch = json.loads(repo_info).get("default_branch") or "main"
-
-            orch_issue_ref = f"{orch_repo}#{orch_issue_number}"
 
             # Find workflow id by path (more reliable than calling by filename directly)
             wfs_json = sh(["gh", "api", f"/repos/{repo}/actions/workflows"])
@@ -140,8 +140,10 @@ jobs:
               "-f", "inputs[base_branch]="+base_branch,
               "-f", "inputs[title]="+title,
               "-f", "inputs[task_id]="+task_id,
-              "-f", "inputs[orch_issue]="+orch_issue_ref,
+              "-f", f"inputs[issue_repo]={orch_repo}",
+              "-f", f"inputs[issue_number]={orch_issue_number}",
               "-f", "inputs[claude_mode]="+claude_mode,
+              "-f", f"inputs[claude_comment]={claude_comment}",
             ])
 
             to_comment.append(f"- TCM-DISPATCHED: {task_id} → {repo} ({branch})")
