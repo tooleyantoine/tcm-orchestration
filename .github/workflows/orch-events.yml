@@ -65,6 +65,28 @@ jobs:
               print("STDERR:", e.stderr)
               raise
 
+          def parse_pr_url(pr_url: str):
+            # https://github.com/OWNER/REPO/pull/123
+            m = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", pr_url)
+            if not m:
+              return None, None
+            return m.group(1), m.group(2)
+
+          CONTRACT_START = "<!-- TCM:CONTRACT -->"
+          CONTRACT_END = "<!-- /TCM:CONTRACT -->"
+
+          def extract_contract_from_pr(pr_repo: str, pr_number: str) -> str:
+            # PR comments live on issues API: /repos/{repo}/issues/{num}/comments
+            comments_json = sh(["gh","api", f"/repos/{pr_repo}/issues/{pr_number}/comments", "--paginate"])
+            comments = json.loads(comments_json) if comments_json else []
+            # Take the newest matching block
+            for c in reversed(comments):
+              body = c.get("body") or ""
+              if CONTRACT_START in body and CONTRACT_END in body:
+                block = body.split(CONTRACT_START, 1)[1].split(CONTRACT_END, 1)[0].strip()
+                return block
+            return ""
+
           ISSUE_REPO = os.environ["ISSUE_REPO"]              # e.g. tooleyantoine/tcm-orchestration
           ISSUE_NUMBER = os.environ["ISSUE_NUMBER"]          # e.g. "2"
           TASK_ID = (os.environ.get("TASK_ID") or "").strip()
@@ -246,6 +268,30 @@ jobs:
             claude = t.get("claude") or {}
             claude_mode = str(claude.get("mode") or "manual").strip()
             claude_comment = str(claude.get("comment") or "").strip()
+
+            # Optional: if mode isn't manual and no comment provided, keep a fallback template
+            if not claude_comment and claude_mode != "manual":
+              claude_comment = f"@claude Task {tid}: {title}"
+            
+            # --- OPTIONAL CONTRACT COPY ---
+            copy_from = t.get("copy_contract_from")
+            copy_from = str(copy_from).strip() if copy_from is not None else ""
+            if copy_from:
+              src = state.get(copy_from) or {}
+              src_pr_url = (src.get("pr") or "").strip()
+              if src_pr_url and src_pr_url != "(pending)":
+                src_repo, src_pr_num = parse_pr_url(src_pr_url)
+                if src_repo and src_pr_num:
+                  contract = extract_contract_from_pr(src_repo, src_pr_num)
+                  if contract:
+                    claude_comment = (claude_comment + "\n\n" if claude_comment else "") + "CONTRACT (copied):\n\n" + contract
+                  else:
+                    print(f"Warning: copy_contract_from={copy_from} but no contract block found on {src_pr_url}")
+                else:
+                  print(f"Warning: could not parse PR URL for copy_contract_from={copy_from}: {src_pr_url}")
+              else:
+                print(f"Warning: copy_contract_from={copy_from} but source PR not available yet (pr={src_pr_url or '(missing)'})")
+            # --- END CONTRACT COPY ---
 
             # Find bootstrap workflow id by path
             workflows_json = sh(["gh", "api", f"/repos/{repo}/actions/workflows"])
