@@ -56,7 +56,7 @@ jobs:
           issue_url = os.environ.get("ISSUE_URL","")
 
           # 1) Extract first fenced YAML block
-          m = re.search(r"```ya?ml\\s*(.*?)```", issue_body, re.DOTALL | re.IGNORECASE)
+          m = re.search(r"```ya?ml\s*(.*?)```", issue_body, re.DOTALL | re.IGNORECASE)
           if not m:
             print("No fenced ```yaml block found in issue body. Nothing to do.")
             raise SystemExit(0)
