@@ -76,15 +76,31 @@ jobs:
           CONTRACT_END = "<!-- /TCM:CONTRACT -->"
 
           def extract_contract_from_pr(pr_repo: str, pr_number: str) -> str:
-            # PR comments live on issues API: /repos/{repo}/issues/{num}/comments
             comments_json = sh(["gh","api", f"/repos/{pr_repo}/issues/{pr_number}/comments", "--paginate"])
             comments = json.loads(comments_json) if comments_json else []
-            # Take the newest matching block
+
+            def extract_from_body(body: str) -> str:
+              if CONTRACT_START in body and CONTRACT_END in body:
+                return body.split(CONTRACT_START, 1)[1].split(CONTRACT_END, 1)[0].strip()
+
+              # Fallback: heading-based contract
+              m = re.search(r"^#\s*CONTRACT:.*$", body, re.IGNORECASE | re.MULTILINE)
+              if not m:
+                return ""
+              start = m.start()
+              tail = body[start:]
+              # end at next horizontal rule or end
+              end_m = re.search(r"^\s*---\s*$", tail, re.MULTILINE)
+              if end_m:
+                return tail[:end_m.start()].strip()
+              return tail.strip()
+
             for c in reversed(comments):
               body = c.get("body") or ""
-              if CONTRACT_START in body and CONTRACT_END in body:
-                block = body.split(CONTRACT_START, 1)[1].split(CONTRACT_END, 1)[0].strip()
+              block = extract_from_body(body)
+              if block:
                 return block
+
             return ""
 
           ISSUE_REPO = os.environ["ISSUE_REPO"]              # e.g. tooleyantoine/tcm-orchestration
@@ -234,8 +250,8 @@ jobs:
           # 6) Compute unlocked tasks: not done + depends_on all done + not dispatched yet
           # We treat "dispatched" as having a PR URL (not pending).
           def is_dispatched(tid: str) -> bool:
-            pr = (state.get(tid, {}).get("pr") or "(pending)").strip()
-            return pr != "(pending)"
+            pr = (state.get(tid, {}).get("pr") or "").strip()
+            return pr not in ("", "(pending)")
 
           done_set = {tid for tid, s in state.items() if s.get("done")}
 
@@ -258,74 +274,81 @@ jobs:
               continue
             to_dispatch.append(tid)
 
+          dispatch_failures = []
+
           # 7) Dispatch newly-unblocked tasks (bootstrap-pr.yml) in their repos
           for tid in to_dispatch:
-            t = task_by_id[tid]
-            repo = str(t.get("repo")).strip()
-            branch = str(t.get("branch")).strip()
-            title = str(t.get("title")).strip()
-            base_branch = str(t.get("base_branch") or "master").strip()
-            claude = t.get("claude") or {}
-            claude_mode = str(claude.get("mode") or "manual").strip()
-            claude_comment = str(claude.get("comment") or "").strip()
+            try:
+              t = task_by_id[tid]
+              repo = str(t.get("repo")).strip()
+              branch = str(t.get("branch")).strip()
+              title = str(t.get("title")).strip()
+              base_branch = str(t.get("base_branch") or "master").strip()
+              claude = t.get("claude") or {}
+              claude_mode = str(claude.get("mode") or "manual").strip()
+              claude_comment = str(claude.get("comment") or "").strip()
 
-            # Optional: if mode isn't manual and no comment provided, keep a fallback template
-            if not claude_comment and claude_mode != "manual":
-              claude_comment = f"@claude Task {tid}: {title}"
-            
-            # --- OPTIONAL CONTRACT COPY ---
-            copy_from = t.get("copy_contract_from")
-            copy_from = str(copy_from).strip() if copy_from is not None else ""
-            if copy_from:
-              src = state.get(copy_from) or {}
-              src_pr_url = (src.get("pr") or "").strip()
-              if src_pr_url and src_pr_url != "(pending)":
-                src_repo, src_pr_num = parse_pr_url(src_pr_url)
-                if src_repo and src_pr_num:
-                  contract = extract_contract_from_pr(src_repo, src_pr_num)
-                  if contract:
-                    claude_comment = (claude_comment + "\n\n" if claude_comment else "") + "CONTRACT (copied):\n\n" + contract
+              # Optional: if mode isn't manual and no comment provided, keep a fallback template
+              if not claude_comment and claude_mode != "manual":
+                claude_comment = f"@claude Task {tid}: {title}"
+              
+              # --- OPTIONAL CONTRACT COPY ---
+              copy_from = t.get("copy_contract_from")
+              copy_from = str(copy_from).strip() if copy_from is not None else ""
+              if copy_from:
+                src = state.get(copy_from) or {}
+                src_pr_url = (src.get("pr") or "").strip()
+                if src_pr_url and src_pr_url != "(pending)":
+                  src_repo, src_pr_num = parse_pr_url(src_pr_url)
+                  if src_repo and src_pr_num:
+                    contract = extract_contract_from_pr(src_repo, src_pr_num)
+                    if contract:
+                      claude_comment = (claude_comment + "\n\n" if claude_comment else "") + "CONTRACT (copied):\n\n" + contract
+                    else:
+                      print(f"Warning: copy_contract_from={copy_from} but no contract block found on {src_pr_url}")
                   else:
-                    print(f"Warning: copy_contract_from={copy_from} but no contract block found on {src_pr_url}")
+                    print(f"Warning: could not parse PR URL for copy_contract_from={copy_from}: {src_pr_url}")
                 else:
-                  print(f"Warning: could not parse PR URL for copy_contract_from={copy_from}: {src_pr_url}")
-              else:
-                print(f"Warning: copy_contract_from={copy_from} but source PR not available yet (pr={src_pr_url or '(missing)'})")
-            # --- END CONTRACT COPY ---
+                  print(f"Warning: copy_contract_from={copy_from} but source PR not available yet (pr={src_pr_url or '(missing)'})")
+              # --- END CONTRACT COPY ---
 
-            # Find bootstrap workflow id by path
-            workflows_json = sh(["gh", "api", f"/repos/{repo}/actions/workflows"])
-            workflows = json.loads(workflows_json).get("workflows", [])
-            wf = next((w for w in workflows if (w.get("path") or "").endswith("/bootstrap-pr.yml")), None)
-            if not wf:
-              raise SystemExit(f"Could not find .github/workflows/bootstrap-pr.yml in {repo}.")
+              # Find bootstrap workflow id by path
+              workflows_json = sh(["gh", "api", f"/repos/{repo}/actions/workflows"])
+              workflows = json.loads(workflows_json).get("workflows", [])
+              wf = next((w for w in workflows if (w.get("path") or "").endswith("/bootstrap-pr.yml")), None)
+              if not wf:
+                raise Exception(f"Could not find .github/workflows/bootstrap-pr.yml in {repo}.")
 
-            workflow_id = wf["id"]
+              workflow_id = wf["id"]
 
-            # Determine repo default branch for dispatch ref
-            repo_info = sh(["gh", "api", f"/repos/{repo}"])
-            default_branch = json.loads(repo_info).get("default_branch") or "master"
+              # Determine repo default branch for dispatch ref
+              repo_info = sh(["gh", "api", f"/repos/{repo}"])
+              default_branch = json.loads(repo_info).get("default_branch") or "master"
 
-            args = [
-              "gh","api","-X","POST",
-              f"/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
-              "-H","Accept: application/vnd.github+json",
-              "-f", f"ref={default_branch}",
-              "-f", f"inputs[task_id]={tid}",
-              "-f", f"inputs[issue_repo]={ISSUE_REPO}",
-              "-f", f"inputs[issue_number]={ISSUE_NUMBER}",
-              "-f", f"inputs[branch]={branch}",
-              "-f", f"inputs[title]={title}",
-              "-f", f"inputs[base_branch]={base_branch}",
-              "-f", f"inputs[claude_mode]={claude_mode}",
-            ]
-            if claude_comment:
-              args += ["-f", f"inputs[claude_comment]={claude_comment}"]
+              args = [
+                "gh","api","-X","POST",
+                f"/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
+                "-H","Accept: application/vnd.github+json",
+                "-f", f"ref={default_branch}",
+                "-f", f"inputs[task_id]={tid}",
+                "-f", f"inputs[issue_repo]={ISSUE_REPO}",
+                "-f", f"inputs[issue_number]={ISSUE_NUMBER}",
+                "-f", f"inputs[branch]={branch}",
+                "-f", f"inputs[title]={title}",
+                "-f", f"inputs[base_branch]={base_branch}",
+                "-f", f"inputs[claude_mode]={claude_mode}",
+              ]
+              if claude_comment:
+                args += ["-f", f"inputs[claude_comment]={claude_comment}"]
 
-            sh(args)
+              sh(args)
 
-            # Mark as dispatched (pending PR link until opened event arrives)
-            state[tid]["pr"] = "(pending)"
+              # Mark as dispatched (pending PR link until opened event arrives)
+              state[tid]["pr"] = "(dispatched)"
+            except Exception as e:
+              dispatch_failures.append(f"- `{tid}` → {task_by_id.get(tid,{}).get('repo','?')}: {e}")
+              # Ensure it remains not-dispatched so it can be retried later
+              state[tid]["pr"] = "(pending)"
 
           # 8) Rebuild status comment content
           new_lines = [MARKER, "## Task status", ""]
@@ -356,6 +379,10 @@ jobs:
             for tid in to_dispatch:
               t = task_by_id[tid]
               new_lines.append(f"- `{tid}` → {t.get('repo')} ({t.get('branch')})")
+
+          if dispatch_failures:
+            new_lines += ["", "### Dispatch failures", ""]
+            new_lines += dispatch_failures
 
           new_lines.append("")
           new_body = "\n".join(new_lines)
