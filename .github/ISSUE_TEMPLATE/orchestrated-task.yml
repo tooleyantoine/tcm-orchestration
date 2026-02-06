@@ -1,0 +1,26 @@
+name: Orchestrate task chains
+
+on:
+  issues:
+    types: [opened, edited]
+  repository_dispatch:
+    types: [tcm_task_update]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Orchestrator placeholder
+        run: |
+          echo "Orchestrator will parse issue + create/update status comment + dispatch repo workflows"
