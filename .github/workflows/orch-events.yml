@@ -242,7 +242,7 @@ jobs:
             repo = str(t.get("repo")).strip()
             branch = str(t.get("branch")).strip()
             title = str(t.get("title")).strip()
-            base_branch = str(t.get("base_branch") or "main").strip()
+            base_branch = str(t.get("base_branch") or "master").strip()
             claude = t.get("claude") or {}
             claude_mode = str(claude.get("mode") or "manual").strip()
             claude_comment = str(claude.get("comment") or "").strip()
@@ -258,7 +258,7 @@ jobs:
 
             # Determine repo default branch for dispatch ref
             repo_info = sh(["gh", "api", f"/repos/{repo}"])
-            default_branch = json.loads(repo_info).get("default_branch") or "main"
+            default_branch = json.loads(repo_info).get("default_branch") or "master"
 
             args = [
               "gh","api","-X","POST",
