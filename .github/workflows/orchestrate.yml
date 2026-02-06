@@ -47,8 +47,14 @@ jobs:
           import yaml
 
           def sh(cmd: list[str]) -> str:
-            res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            return res.stdout.strip()
+              try:
+                res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                return res.stdout.strip()
+              except subprocess.CalledProcessError as e:
+                print("COMMAND FAILED:", " ".join(cmd))
+                print("STDOUT:", e.stdout)
+                print("STDERR:", e.stderr)
+                raise
 
           issue_body = os.environ.get("ISSUE_BODY") or ""
           orch_repo = os.environ["ORCH_REPO"]
@@ -115,28 +121,24 @@ jobs:
 
             orch_issue_ref = f"{orch_repo}#{orch_issue_number}"
 
-            # Dispatch bootstrap workflow by file path (stable)
-            payload = json.dumps({
-              "ref": default_branch,
-              "inputs": {
-                "branch": branch,
-                "base_branch": base_branch,
-                "pr_title": title,
-                "task_id": task_id,
-                "orch_issue": orch_issue_ref,
-                "claude_mode": claude_mode,
-              }
-            })
+            # Find workflow id by path (more reliable than calling by filename directly)
+            wfs_json = sh(["gh", "api", f"/repos/{repo}/actions/workflows"])
+            wfs = json.loads(wfs_json).get("workflows", [])
+            wf = next((w for w in wfs if (w.get("path") or "").endswith("/bootstrap-pr.yml")), None)
+            if not wf:
+              raise SystemExit(f"Could not find workflow bootstrap-pr.yml in {repo}. Is it on the default branch and in .github/workflows/?")
+
+            workflow_id = wf["id"]
 
             sh([
               "gh", "api",
               "-X", "POST",
-              f"/repos/{repo}/actions/workflows/bootstrap-pr.yml/dispatches",
+              f"/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
               "-H", "Accept: application/vnd.github+json",
               "-f", f"ref={default_branch}",
               "-f", "inputs[branch]="+branch,
               "-f", "inputs[base_branch]="+base_branch,
-              "-f", "inputs[pr_title]="+title,
+              "-f", "inputs[title]="+title,
               "-f", "inputs[task_id]="+task_id,
               "-f", "inputs[orch_issue]="+orch_issue_ref,
               "-f", "inputs[claude_mode]="+claude_mode,
