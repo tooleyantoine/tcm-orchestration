@@ -1,0 +1,326 @@
+name: Orchestration Events
+
+on:
+  repository_dispatch:
+    types: [tcm_task_pr_opened, tcm_task_pr_closed]
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: orch-events-${{ github.event.client_payload.issue_repo }}-${{ github.event.client_payload.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  handle:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.ORCH_TOKEN }}
+
+    steps:
+      - name: Validate payload + token
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "Missing secrets.ORCH_TOKEN"
+            exit 1
+          fi
+          if [ -z "${{ github.event.client_payload.issue_repo }}" ] || [ -z "${{ github.event.client_payload.issue_number }}" ]; then
+            echo "Missing client_payload.issue_repo or client_payload.issue_number"
+            exit 1
+          fi
+
+      - name: Install PyYAML
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: Update status + unlock dependencies
+        env:
+          EVENT_TYPE: ${{ github.event.action }}
+          ISSUE_REPO: ${{ github.event.client_payload.issue_repo }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          TASK_ID: ${{ github.event.client_payload.task_id }}
+          SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          PR_URL: ${{ github.event.client_payload.pr_url }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          MERGED: ${{ github.event.client_payload.merged }}
+        run: |
+          set -euo pipefail
+
+          python <<'PY'
+          import os, re, json, subprocess
+          import yaml
+          from typing import Dict, Any, Optional
+
+          def sh(cmd: list[str]) -> str:
+            try:
+              res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              return res.stdout.strip()
+            except subprocess.CalledProcessError as e:
+              print("COMMAND FAILED:", " ".join(cmd))
+              print("STDOUT:", e.stdout)
+              print("STDERR:", e.stderr)
+              raise
+
+          ISSUE_REPO = os.environ["ISSUE_REPO"]              # e.g. tooleyantoine/tcm-orchestration
+          ISSUE_NUMBER = os.environ["ISSUE_NUMBER"]          # e.g. "2"
+          TASK_ID = (os.environ.get("TASK_ID") or "").strip()
+          PR_URL = (os.environ.get("PR_URL") or "").strip()
+          PR_NUMBER = (os.environ.get("PR_NUMBER") or "").strip()
+          SOURCE_REPO = (os.environ.get("SOURCE_REPO") or "").strip()
+          EVENT_NAME = os.environ.get("EVENT_TYPE") or ""    # repository_dispatch
+          EVENT_TYPE = os.environ.get("GITHUB_EVENT_NAME") or ""
+
+          # repository_dispatch type is in the GitHub event payload; easiest: read it from env via file
+          event_path = os.environ.get("GITHUB_EVENT_PATH")
+          dispatch_type = ""
+          if event_path:
+            payload = json.loads(open(event_path, "r", encoding="utf-8").read())
+            dispatch_type = payload.get("action") or payload.get("event_type") or payload.get("repository_dispatch", "")
+            # In practice, for repository_dispatch, "action" isn't the type; use payload["action"]? Not reliable.
+            dispatch_type = payload.get("event_type") or payload.get("action") or payload.get("event", "")
+            # GitHub puts it at top-level "action" sometimes, but safest:
+            dispatch_type = payload.get("action") or payload.get("event_type") or payload.get("event", "")
+            # Actually GitHub's repository_dispatch exposes the type as payload["action"] in some runners,
+            # but always has payload["event"]["action"]? We'll just also check:
+            dispatch_type = payload.get("action") or payload.get("event_type") or payload.get("event", "")
+            # If still empty, fall back to env hint:
+            if not dispatch_type:
+              dispatch_type = os.environ.get("DISPATCH_TYPE","")
+          # However, Actions provides the dispatch type as github.event.action in expressions, not in env.
+          # We'll parse it from the event JSON: payload["action"] is the dispatch type in GH Actions.
+          if event_path:
+            payload = json.loads(open(event_path, "r", encoding="utf-8").read())
+            dispatch_type = payload.get("action","")
+
+          if not dispatch_type:
+            # last resort: use presence of MERGED to infer closed vs opened
+            dispatch_type = "tcm_task_pr_closed" if os.environ.get("MERGED") not in ("", None) else "tcm_task_pr_opened"
+
+          merged_raw = (os.environ.get("MERGED") or "").strip().lower()
+          merged = merged_raw == "true"
+
+          # 1) Load orchestration issue (body)
+          issue_json = sh(["gh", "api", f"/repos/{ISSUE_REPO}/issues/{ISSUE_NUMBER}"])
+          issue = json.loads(issue_json)
+          body = issue.get("body") or ""
+
+          # 2) Extract first fenced YAML block
+          m = re.search(r"```ya?ml\s*(.*?)```", body, re.DOTALL | re.IGNORECASE)
+          if not m:
+            raise SystemExit("No fenced ```yaml block found in orchestration issue body.")
+
+          data = yaml.safe_load(m.group(1).strip()) or {}
+          tasks = data.get("tasks") or []
+          if not isinstance(tasks, list) or not tasks:
+            raise SystemExit("No tasks found under `tasks:`.")
+
+          # Index tasks by id
+          task_by_id: Dict[str, Dict[str, Any]] = {}
+          for t in tasks:
+            if isinstance(t, dict) and t.get("id"):
+              task_by_id[str(t["id"]).strip()] = t
+
+          if TASK_ID and TASK_ID not in task_by_id:
+            print(f"Warning: task_id '{TASK_ID}' not present in issue YAML; will still update comment if line exists.")
+
+          # 3) Find or create status comment
+          MARKER = "<!-- TCM:STATUS -->"
+
+          comments_json = sh(["gh", "api", f"/repos/{ISSUE_REPO}/issues/{ISSUE_NUMBER}/comments", "--paginate"])
+          comments = json.loads(comments_json) if comments_json else []
+          status_comment = None
+          for c in comments:
+            if MARKER in (c.get("body") or ""):
+              status_comment = c
+              break
+
+          # Helper: build an initial checklist from YAML
+          def initial_status_comment() -> str:
+            lines = [MARKER, "## Task status", ""]
+            for t in tasks:
+              if not isinstance(t, dict): 
+                continue
+              tid = str(t.get("id") or "").strip()
+              repo = str(t.get("repo") or "").strip()
+              title = str(t.get("title") or "").strip()
+              depends = t.get("depends_on") or []
+              dep_txt = ""
+              if depends:
+                dep_txt = f" — **blocked** (depends_on: {', '.join([str(x) for x in depends])})"
+              lines.append(f"- [ ] `{tid}` — {title} — _{repo}_ — PR: (pending){dep_txt}")
+            lines.append("")
+            return "\n".join(lines)
+
+          if not status_comment:
+            created = sh([
+              "gh","api","-X","POST",
+              f"/repos/{ISSUE_REPO}/issues/{ISSUE_NUMBER}/comments",
+              "-f", "body="+initial_status_comment()
+            ])
+            status_comment = json.loads(created)
+
+          status_id = status_comment["id"]
+          status_body = status_comment.get("body") or ""
+
+          # 4) Parse current state from status comment
+          # Expected line format (we keep it flexible):
+          # - [ ] `task-id` — ... — PR: <url or (pending)> ...
+          line_re = re.compile(r"^- \[(?P<done>[ xX])\]\s+`(?P<id>[^`]+)`(?P<rest>.*)$")
+          pr_re = re.compile(r"PR:\s*(?P<pr>\S+|\(pending\))", re.IGNORECASE)
+
+          state: Dict[str, Dict[str, Any]] = {}
+          out_lines = []
+          for line in status_body.splitlines():
+            m2 = line_re.match(line.strip())
+            if not m2:
+              out_lines.append(line)
+              continue
+            tid = m2.group("id").strip()
+            done = m2.group("done").strip().lower() == "x"
+            rest = m2.group("rest")
+            pr_m = pr_re.search(rest)
+            pr_val = pr_m.group("pr") if pr_m else "(pending)"
+            state[tid] = {"done": done, "pr": pr_val, "raw": line}
+            out_lines.append(line)  # we will rewrite later
+
+          # Ensure all YAML tasks exist in state (in case comment was old)
+          for tid, t in task_by_id.items():
+            if tid not in state:
+              state[tid] = {"done": False, "pr": "(pending)"}
+
+          # 5) Apply incoming event to state
+          if TASK_ID:
+            if TASK_ID not in state:
+              state[TASK_ID] = {"done": False, "pr": "(pending)"}
+
+            if dispatch_type == "tcm_task_pr_opened":
+              if PR_URL:
+                state[TASK_ID]["pr"] = PR_URL
+              state[TASK_ID]["done"] = False
+
+            elif dispatch_type == "tcm_task_pr_closed":
+              if PR_URL:
+                state[TASK_ID]["pr"] = PR_URL
+              # Only mark complete if merged
+              if merged:
+                state[TASK_ID]["done"] = True
+
+          # 6) Compute unlocked tasks: not done + depends_on all done + not dispatched yet
+          # We treat "dispatched" as having a PR URL (not pending).
+          def is_dispatched(tid: str) -> bool:
+            pr = (state.get(tid, {}).get("pr") or "(pending)").strip()
+            return pr != "(pending)"
+
+          done_set = {tid for tid, s in state.items() if s.get("done")}
+
+          def deps_satisfied(tid: str) -> bool:
+            t = task_by_id.get(tid) or {}
+            deps = t.get("depends_on") or []
+            return all(str(d).strip() in done_set for d in deps)
+
+          to_dispatch = []
+          for tid, t in task_by_id.items():
+            if tid in done_set:
+              continue
+            if is_dispatched(tid):
+              continue
+            if not deps_satisfied(tid):
+              continue
+
+            # Minimal required fields
+            if not t.get("repo") or not t.get("branch") or not t.get("title"):
+              continue
+            to_dispatch.append(tid)
+
+          # 7) Dispatch newly-unblocked tasks (bootstrap-pr.yml) in their repos
+          for tid in to_dispatch:
+            t = task_by_id[tid]
+            repo = str(t.get("repo")).strip()
+            branch = str(t.get("branch")).strip()
+            title = str(t.get("title")).strip()
+            base_branch = str(t.get("base_branch") or "main").strip()
+            claude = t.get("claude") or {}
+            claude_mode = str(claude.get("mode") or "manual").strip()
+            claude_comment = str(claude.get("comment") or "").strip()
+
+            # Find bootstrap workflow id by path
+            workflows_json = sh(["gh", "api", f"/repos/{repo}/actions/workflows"])
+            workflows = json.loads(workflows_json).get("workflows", [])
+            wf = next((w for w in workflows if (w.get("path") or "").endswith("/bootstrap-pr.yml")), None)
+            if not wf:
+              raise SystemExit(f"Could not find .github/workflows/bootstrap-pr.yml in {repo}.")
+
+            workflow_id = wf["id"]
+
+            # Determine repo default branch for dispatch ref
+            repo_info = sh(["gh", "api", f"/repos/{repo}"])
+            default_branch = json.loads(repo_info).get("default_branch") or "main"
+
+            args = [
+              "gh","api","-X","POST",
+              f"/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
+              "-H","Accept: application/vnd.github+json",
+              "-f", f"ref={default_branch}",
+              "-f", f"inputs[task_id]={tid}",
+              "-f", f"inputs[issue_repo]={ISSUE_REPO}",
+              "-f", f"inputs[issue_number]={ISSUE_NUMBER}",
+              "-f", f"inputs[branch]={branch}",
+              "-f", f"inputs[title]={title}",
+              "-f", f"inputs[base_branch]={base_branch}",
+              "-f", f"inputs[claude_mode]={claude_mode}",
+            ]
+            if claude_comment:
+              args += ["-f", f"inputs[claude_comment]={claude_comment}"]
+
+            sh(args)
+
+            # Mark as dispatched (pending PR link until opened event arrives)
+            state[tid]["pr"] = "(pending)"
+
+          # 8) Rebuild status comment content
+          new_lines = [MARKER, "## Task status", ""]
+          for t in tasks:
+            if not isinstance(t, dict):
+              continue
+            tid = str(t.get("id") or "").strip()
+            repo = str(t.get("repo") or "").strip()
+            title = str(t.get("title") or "").strip()
+            deps = t.get("depends_on") or []
+            s = state.get(tid, {"done": False, "pr": "(pending)"})
+            checkbox = "x" if s.get("done") else " "
+            pr_val = s.get("pr") or "(pending)"
+
+            suffix = ""
+            if deps and not deps_satisfied(tid) and not s.get("done"):
+              suffix = f" — **blocked** (depends_on: {', '.join([str(x) for x in deps])})"
+
+            # If merged, annotate
+            if s.get("done"):
+              suffix = " — ✅ merged"
+
+            # If not done and PR exists (not pending), show open/closed unknown (we keep minimal)
+            new_lines.append(f"- [{checkbox}] `{tid}` — {title} — _{repo}_ — PR: {pr_val}{suffix}")
+
+          if to_dispatch:
+            new_lines += ["", "### Auto-dispatched", ""]
+            for tid in to_dispatch:
+              t = task_by_id[tid]
+              new_lines.append(f"- `{tid}` → {t.get('repo')} ({t.get('branch')})")
+
+          new_lines.append("")
+          new_body = "\n".join(new_lines)
+
+          # 9) Update status comment if changed
+          if new_body.strip() != (status_body or "").strip():
+            sh([
+              "gh","api","-X","PATCH",
+              f"/repos/{ISSUE_REPO}/issues/comments/{status_id}",
+              "-f","body="+new_body
+            ])
+
+          print("Status updated.")
+          PY
