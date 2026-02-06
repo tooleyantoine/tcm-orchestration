@@ -100,7 +100,7 @@ jobs:
             title = str(t.get("title") or "").strip()
 
             # defaults
-            base_branch = str(t.get("base_branch") or "main").strip()
+            base_branch = str(t.get("base_branch") or "master").strip()
             claude_mode = str(((t.get("claude") or {}).get("mode")) or "manual").strip()
 
             claude_comment = f"@claude Task {task_id}: {title}\n\nRef: {orch_repo}#{orch_issue_number}"
@@ -119,7 +119,7 @@ jobs:
 
             # Determine target repo default branch (so we can dispatch against it reliably)
             repo_info = sh(["gh", "api", f"/repos/{repo}"])
-            default_branch = json.loads(repo_info).get("default_branch") or "main"
+            default_branch = json.loads(repo_info).get("default_branch") or "master"
 
             # Find workflow id by path (more reliable than calling by filename directly)
             wfs_json = sh(["gh", "api", f"/repos/{repo}/actions/workflows"])
