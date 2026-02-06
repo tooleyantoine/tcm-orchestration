@@ -103,7 +103,9 @@ jobs:
             base_branch = str(t.get("base_branch") or "master").strip()
             claude_mode = str(((t.get("claude") or {}).get("mode")) or "manual").strip()
 
-            claude_comment = f"@claude Task {task_id}: {title}\n\nRef: {orch_repo}#{orch_issue_number}"
+            claude_comment = str(claude.get("comment") or "").strip()
+            if not claude_comment and claude_mode != "manual":
+              claude_comment = f"@claude Task {task_id}: {title}"
 
             depends_on = t.get("depends_on") or []
             if depends_on and len(depends_on) > 0:
